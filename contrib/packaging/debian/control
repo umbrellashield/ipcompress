@@ -1,0 +1,18 @@
+Source: iprohc
+Priority: optional
+Maintainer: Viveris Technologies
+Build-Depends: debhelper (>= 7.0.15), libtool, iproute-dev, librohc-dev, libgnutls-dev, libyaml-dev
+Standards-Version: 3.8.4
+Section: libs
+
+Package: iprohc-server
+Architecture: any
+Depends: ${misc:Depends}, librohc, libgnutls26, libyaml-0-2
+Description: A tunnel application using ROHC to
+  compress packets headers. Server part.
+
+Package: iprohc-client
+Architecture: any
+Depends: ${misc:Depends}, librohc, libgnutls26
+Description: A tunnel application using ROHC to
+  compress packets headers. Client part.

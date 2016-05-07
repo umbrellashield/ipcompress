@@ -1,0 +1,32 @@
+Release 0.8.0 (XX Xxx 2013)
+	Fix multi-threading model.
+	Handle up to 2000 clients.
+	Support for ROHC library 1.7.0.
+
+Release 0.7 (27 Jun 2013)
+	No detail.
+
+Release 0.6 (25 Mar 2013)
+	Do not use static variables in threaded functions.
+	At client, filter traffic on destination IP address to avoid mixing
+		traffic between several clients.
+	Do not print syslog traces on stderr.
+	Style cleanup.
+
+Release 0.5 (18 Mar 2013)
+	Robustify client & server.
+	Fix memory leaks.
+	Fix file descriptor leaks.
+
+Release 0.4 (27 Nov 2012)
+	Missing information.
+
+Release 0.3 (10 Oct 2012)
+	Missing information.
+
+Release 0.2 (29 Jun 2012)
+	Missing information.
+
+Release 0.1 (30 May 2012)
+	Missing information.
+

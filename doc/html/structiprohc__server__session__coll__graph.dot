@@ -1,0 +1,15 @@
+digraph "iprohc_server_session"
+{
+  edge [fontname="FreeSans",fontsize="10",labelfontname="FreeSans",labelfontsize="10"];
+  node [fontname="FreeSans",fontsize="10",shape=record];
+  Node1 [label="iprohc_server_session",height=0.2,width=0.4,color="black", fillcolor="grey75", style="filled" fontcolor="black"];
+  Node2 -> Node1 [dir="back",color="darkorchid3",fontsize="10",style="dashed",label=" session" ,fontname="FreeSans"];
+  Node2 [label="iprohc_session",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$structiprohc__session.html"];
+  Node3 -> Node2 [dir="back",color="darkorchid3",fontsize="10",style="dashed",label=" tunnel" ,fontname="FreeSans"];
+  Node3 [label="iprohc_tunnel",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$structiprohc__tunnel.html"];
+  Node4 -> Node3 [dir="back",color="darkorchid3",fontsize="10",style="dashed",label=" stats" ,fontname="FreeSans"];
+  Node4 [label="statitics",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$structstatitics.html"];
+  Node5 -> Node3 [dir="back",color="darkorchid3",fontsize="10",style="dashed",label=" params" ,fontname="FreeSans"];
+  Node5 [label="tunnel_params",height=0.2,width=0.4,color="black", fillcolor="white", style="filled",URL="$structtunnel__params.html"];
+  Node2 -> Node2 [dir="back",color="darkorchid3",fontsize="10",style="dashed",label=" handle_ctrl_msg\nstop_ctrl\nstart_ctrl" ,fontname="FreeSans"];
+}

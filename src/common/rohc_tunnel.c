@@ -1,0 +1,1672 @@
+/*
+This file is part of iprohc.
+
+iprohc is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 2 of the License, or
+any later version.
+
+iprohc is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with iprohc.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/* rohc_tunnel.c -- Functions handling a tunnel, client or server-side
+*/
+
+#include "session.h"
+#include "ip_chksum.h"
+#include "log.h"
+#include "utils.h"
+
+#include "config.h"
+
+#include <assert.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <signal.h>
+#include <errno.h>
+#include <stdarg.h>
+#include <netinet/ip.h>
+#include <netinet/udp.h>
+#include <linux/if_tun.h>
+#include <net/ethernet.h>
+
+#include <sys/timerfd.h>
+#include <sys/epoll.h>
+
+
+/*
+ * Macros & definitions:
+ */
+
+/// The maximal size of a ROHC packet
+#define MAX_ROHC_SIZE   (5 * 1024)
+
+#define MAX_TRACE_SIZE 2048
+
+#ifndef ROHC_VER_LESS_2_0
+#define LINUX_COOKED_HDR_LEN  16U
+#endif
+
+/** Print in logs a trace related to the given tunnel */
+#define tunnel_trace(tunnel, prio, format, ...) \
+	do \
+	{ \
+		if((tunnel)->dst_addr_str[0] == '\0') \
+		{ \
+			trace((prio), "[client %s] " format, \
+			      (tunnel)->dst_addr_str, ##__VA_ARGS__); \
+		} \
+		else \
+		{ \
+			trace((prio), format, ##__VA_ARGS__); \
+		} \
+	} \
+	while(0)
+
+
+
+/* Prototypes for local functions */
+
+void dump_packet(char *descr, unsigned char *packet, unsigned int length);
+#ifdef ROHC_VER_LESS_2_0
+static void print_rohc_traces(rohc_trace_level_t level,
+                              rohc_trace_entity_t entity,
+                              int profile,
+                              const char *format, ...)
+__attribute__((format (printf, 4, 5)));
+#else
+static void print_rohc_traces(void *const priv_ctxt,
+                              const rohc_trace_level_t level,
+                              const rohc_trace_entity_t entity,
+                              const int profile,
+                              const char *const format,
+                              ...)
+	__attribute__((format(printf, 5, 6), nonnull(5)));
+#endif
+bool callback_rtp_detect(const unsigned char *const ip,
+                         const unsigned char *const udp,
+                         const unsigned char *const payload,
+                         const unsigned int payload_size,
+                         void *const rtp_private);
+int send_puree(int to,
+               struct in_addr raddr,
+               const size_t mtu,
+               unsigned char *compressed_packet,
+               size_t *total_size,
+               size_t *act_comp,
+               struct statitics *stats);
+int raw2tun(struct rohc_decomp *decomp,
+            in_addr_t dst_addr,
+            int from,
+            int to,
+				const size_t mtu,
+            struct statitics *stats);
+int tun2raw(struct rohc_comp *comp,
+            int from,
+            int to,
+            struct in_addr raddr,
+            const size_t mtu,
+            unsigned char *const packing_frame,
+            const size_t packing_max_len,
+            size_t *const packing_cur_len,
+            const size_t packing_max_pkts,
+            size_t *const packing_cur_pkts,
+            struct statitics *stats);
+
+static void gnutls_transport_set_ptr_nowarn(gnutls_session_t session, int ptr);
+
+/**
+ * @brief Generate a false random number for testing the ROHC library
+ *
+ * @param comp          The ROHC compressor
+ * @param user_context  Should always be NULL
+ * @return              Always 0
+ */
+static int gen_false_random_num(const struct rohc_comp *const comp,
+                                void *const user_context)
+{
+	assert(comp != NULL);
+	assert(user_context == NULL);
+	return 0;
+}
+
+
+/*
+ * Main functions
+ */
+
+
+/**
+ * @brief Initialize the given tunnel context
+ *
+ * @param tunnel        The tunnel context to initialize
+ * @param params        The configuration parameters of the tunnel
+ * @param local_addr    The local address for tunnel traffic
+ * @param raw_socket    The RAW socket to use to send packets to remote endpoint
+ * @param tun_fd        The file descriptor of the local TUN interface
+ * @param base_dev_mtu  The MTU of the base device used to send packets to the
+ *                      remote endpoint
+ * @param tun_dev_mtu   The MTU of the local TUN interface
+ * @return              true if tunnel was successfully initialized,
+ *                      false if a problem occurred
+ */
+bool iprohc_tunnel_new(struct iprohc_tunnel *const tunnel,
+                       const struct tunnel_params params,
+                       const uint32_t local_addr,
+                       const int raw_socket,
+                       const int tun_fd,
+                       const size_t base_dev_mtu,
+                       const size_t tun_dev_mtu)
+{
+	rohc_mode_t rohc_mode;
+	//struct rohc_comp *asso_comp;
+	bool is_ok;
+
+	assert(tunnel != NULL);
+	assert(raw_socket >= 0);
+	assert(tun_fd >= 0);
+
+	/* TUN interface */
+	tunnel->tun_fd_in = tun_fd;
+	tunnel->tun_fd_out = tun_fd;
+
+	/* RAW socket */
+	tunnel->raw_socket_in = raw_socket;
+	tunnel->raw_socket_out = raw_socket;
+
+	/* device MTU */
+	tunnel->tun_itf_mtu = tun_dev_mtu;
+	tunnel->basedev_mtu = base_dev_mtu;
+
+	/* record tunnel parameters */
+	memcpy(&tunnel->params, &params, sizeof(struct tunnel_params));
+
+	/* record the local address */
+	tunnel->params.local_address = local_addr;
+
+	/* reset stats */
+	memset(&tunnel->stats, 0, sizeof(struct statitics));
+	tunnel->stats.n_stats_packing = tunnel->params.packing + 1;
+	tunnel->stats.stats_packing = calloc(tunnel->stats.n_stats_packing, sizeof(int));
+	if(tunnel->stats.stats_packing == NULL)
+	{
+		trace(LOG_ERR, "failed to allocate memory for packing stats");
+		goto error;
+	}
+
+	/* create the compressor and activate profiles */
+#ifdef ROHC_VER_LESS_2_0
+	tunnel->comp = rohc_comp_new(ROHC_SMALL_CID, tunnel->params.max_cid);
+#else
+	tunnel->comp = rohc_comp_new2(ROHC_SMALL_CID, tunnel->params.max_cid,
+								 gen_false_random_num, NULL);
+#endif
+	if(tunnel->comp == NULL)
+	{
+		trace(LOG_ERR, "failed to create the ROHC compressor");
+		goto free_packing_stats;
+	}
+
+	/* handle compressor traces */
+#ifdef ROHC_VER_LESS_2_0
+	is_ok = rohc_comp_set_traces_cb(tunnel->comp, print_rohc_traces);
+#else
+	is_ok = rohc_comp_set_traces_cb2(tunnel->comp, print_rohc_traces, NULL);
+#endif
+	if(!is_ok)
+	{
+		trace(LOG_ERR, "faield to set trace callback for compressor");
+		goto destroy_comp;
+	}
+
+	/* enable all safe compression profiles */
+	is_ok = rohc_comp_enable_profiles(tunnel->comp,
+	                                  ROHC_PROFILE_UNCOMPRESSED,
+	                                  ROHC_PROFILE_IP,
+	                                  ROHC_PROFILE_UDP,
+	                                  ROHC_PROFILE_RTP,
+	                                  -1);
+	if(!is_ok)
+	{
+		trace(LOG_ERR, "failed to enable profiles for compressor");
+		goto destroy_comp;
+	}
+
+	/* set RTP callback for detecting RTP packets */
+	is_ok = rohc_comp_set_rtp_detection_cb(tunnel->comp, callback_rtp_detect, NULL);
+	if(!is_ok)
+	{
+		trace(LOG_ERR, "failed to set RTP detection callback");
+		goto destroy_comp;
+	}
+
+	/* decompressor parameters that depend on operation mode */
+	if(tunnel->params.is_unidirectional)
+	{
+		rohc_mode = ROHC_U_MODE;
+		//asso_comp = NULL;
+	}
+	else
+	{
+		rohc_mode = ROHC_O_MODE;
+		//asso_comp = tunnel->comp;
+	}
+	/* create the decompressor (associate it with the compressor) */
+#ifdef ROHC_VER_LESS_2_0
+	tunnel->decomp = rohc_decomp_new(ROHC_SMALL_CID, tunnel->params.max_cid, rohc_mode, asso_comp);
+#else
+	tunnel->decomp = rohc_decomp_new2(ROHC_SMALL_CID, tunnel->params.max_cid, rohc_mode);
+#endif
+	if(tunnel->decomp == NULL)
+	{
+		trace(LOG_ERR, "failed to create the ROHC decompressor");
+		goto destroy_comp;
+	}
+
+	/* handle decompressor trace */
+#ifdef ROHC_VER_LESS_2_0
+	is_ok = rohc_decomp_set_traces_cb(tunnel->decomp, print_rohc_traces);
+#else
+	is_ok = rohc_decomp_set_traces_cb2(tunnel->decomp, print_rohc_traces, NULL);
+#endif
+	if(!is_ok)
+	{
+		trace(LOG_ERR, "failed to set trace callback for decompressor");
+		goto destroy_decomp;
+	}
+
+	/* enable all safe decompression profiles */
+	is_ok = rohc_decomp_enable_profiles(tunnel->decomp,
+	                                    ROHC_PROFILE_UNCOMPRESSED,
+	                                    ROHC_PROFILE_IP,
+	                                    ROHC_PROFILE_UDP,
+	                                    ROHC_PROFILE_RTP,
+	                                    -1);
+	if(!is_ok)
+	{
+		trace(LOG_ERR, "failed to enable profiles for decompressor");
+		goto destroy_decomp;
+	}
+
+	tunnel->is_init = true;
+	return true;
+
+destroy_decomp:
+	rohc_decomp_free(tunnel->decomp);
+destroy_comp:
+	rohc_comp_free(tunnel->comp);
+free_packing_stats:
+	free(tunnel->stats.stats_packing);
+error:
+	return false;
+}
+
+
+/**
+ * @brief Reset the given tunnel context
+ *
+ * @param tunnel  The tunnel context to reset
+ * @return        true if the tunnel was successfully reset,
+ *                false if a problem occurred
+ */
+bool iprohc_tunnel_free(struct iprohc_tunnel *const tunnel)
+{
+	if(tunnel->is_init)
+	{
+		/* free the ROHC compressor and decompressor */
+		rohc_decomp_free(tunnel->decomp);
+		rohc_comp_free(tunnel->comp);
+
+		/* reset RAW sockets and TUN fds: do not close them, they are shared with
+		 * other clients */
+		tunnel->tun_fd_in = -1;
+		tunnel->tun_fd_out = -1;
+		tunnel->raw_socket_in = -1;
+		tunnel->raw_socket_out = -1;
+
+		/* device MTU */
+		tunnel->tun_itf_mtu = 0;
+		tunnel->basedev_mtu = 0;
+
+		/* no more parameter */
+		memset(&tunnel->params, 0, sizeof(struct tunnel_params));
+
+		/* reset stats */
+		free(tunnel->stats.stats_packing);
+		memset(&tunnel->stats, 0, sizeof(struct statitics));
+
+		tunnel->is_init = false;
+	}
+
+	return true;
+}
+
+
+/**
+ * @brief Start a new tunnel
+ *
+ * This function is intented to be started as a thread. It
+ * will assume that the fields of tunnel are correctly filled,
+ * specially that the tun and raw_socket are correctly opened
+ *
+ * This function will initialize ROHC contexts and start polling tun and
+ * raw socket to compress/decompress the packets via the other functions.
+ *
+ * @param arg    A tunnel session
+ * @return       NULL in case of success, a non-null value otherwise
+ */
+void * iprohc_tunnel_run(void *arg)
+{
+	struct iprohc_session *const session = (struct iprohc_session *) arg;
+	struct iprohc_tunnel *const tunnel = &(session->tunnel);
+
+	unsigned int verify_status;
+
+	int failure = 0;
+	int ret;
+
+	struct epoll_event poll_pipe;
+	struct epoll_event poll_tcp;
+	struct epoll_event poll_ka;
+	struct epoll_event poll_packing;
+	struct epoll_event poll_tun;
+	struct epoll_event poll_raw;
+	const size_t max_events_nr = 1;
+	struct epoll_event events[max_events_nr];
+	int pollfd;
+
+	size_t packing_cur_len = 0;  /* number of packed bytes */
+	size_t packing_cur_pkts = 0;  /* number of packed frames */
+
+	/* TODO : Check assumed present attributes
+	   (thread, local_address, dest_address, tun, fake_tun, raw_socket) */
+
+	tunnel_trace(session, LOG_INFO, "start of thread");
+
+	/* Get rid of warning, it's a "bug" of GnuTLS
+	 * (see http://lists.gnu.org/archive/html/help-gnutls/2006-03/msg00020.html) */
+	gnutls_transport_set_ptr_nowarn(session->tls_session, session->tcp_socket);
+
+	/* perform TLS handshake */
+	do
+	{
+		ret = gnutls_handshake(session->tls_session);
+	}
+	while(ret < 0 && gnutls_error_is_fatal(ret) == 0);
+	if(ret < 0)
+	{
+		tunnel_trace(session, LOG_ERR, "TLS handshake failed: %s (%d)",
+		             gnutls_strerror(ret), ret);
+		goto error;
+	}
+	tunnel_trace(session, LOG_INFO, "TLS handshake succeeded");
+
+	/* check the peer certificate */
+	ret = gnutls_certificate_verify_peers2(session->tls_session, &verify_status);
+	if(ret < 0)
+	{
+		tunnel_trace(session, LOG_ERR, "TLS verify failed: %s (%d)",
+		             gnutls_strerror(ret), ret);
+		goto tls_bye;
+	}
+	if((verify_status & GNUTLS_CERT_INVALID) &&
+	   (verify_status != (GNUTLS_CERT_INSECURE_ALGORITHM | GNUTLS_CERT_INVALID)))
+	{
+		tunnel_trace(session, LOG_ERR, "certificate cannot be verified "
+		             "(status %u)", verify_status);
+		if(verify_status & GNUTLS_CERT_REVOKED)
+		{
+			tunnel_trace(session, LOG_ERR, "- revoked certificate");
+		}
+		if(verify_status & GNUTLS_CERT_SIGNER_NOT_FOUND)
+		{
+			tunnel_trace(session, LOG_ERR, "- unable to trust certificate issuer");
+		}
+		if(verify_status & GNUTLS_CERT_SIGNER_NOT_CA)
+		{
+			tunnel_trace(session, LOG_ERR, "- certificate issuer is not a CA");
+		}
+#ifdef GNUTLS_CERT_NOT_ACTIVATED
+		if(verify_status & GNUTLS_CERT_NOT_ACTIVATED)
+		{
+			tunnel_trace(session, LOG_ERR, "- the certificate is not activated");
+		}
+#endif
+#ifdef GNUTLS_CERT_EXPIRED
+		if(verify_status & GNUTLS_CERT_EXPIRED)
+		{
+			tunnel_trace(session, LOG_ERR, "- the certificate has expired");
+		}
+#endif
+		goto tls_bye;
+	}
+	trace(LOG_INFO, "remote certificate accepted");
+
+	/* we want to monitor some fds */
+	pollfd = epoll_create(1);
+	if(pollfd < 0)
+	{
+		tunnel_trace(session, LOG_ERR, "failed to create epoll context: %s (%d)",
+		             strerror(errno), errno);
+		goto tls_bye;
+	}
+
+	/* will monitor the read side of the pipe */
+	poll_pipe.events = EPOLLIN;
+	memset(&poll_pipe.data, 0, sizeof(poll_pipe.data));
+	poll_pipe.data.fd = session->p2c[0];
+	ret = epoll_ctl(pollfd, EPOLL_CTL_ADD, session->p2c[0], &poll_pipe);
+	if(ret != 0)
+	{
+		tunnel_trace(session, LOG_ERR, "failed to add pipe to epoll context: "
+		             "%s (%d)", strerror(errno), errno);
+		goto close_pollfd;
+	}
+
+	/* will monitor the TCP socket */
+	poll_tcp.events = EPOLLIN;
+	memset(&poll_tcp.data, 0, sizeof(poll_tcp.data));
+	poll_tcp.data.fd = session->tcp_socket;
+	ret = epoll_ctl(pollfd, EPOLL_CTL_ADD, session->tcp_socket, &poll_tcp);
+	if(ret != 0)
+	{
+		tunnel_trace(session, LOG_ERR, "failed to add TCP socket to epoll "
+		             "context: %s (%d)", strerror(errno), errno);
+		goto close_pollfd;
+	}
+
+	/* will monitor the keepalive timer */
+	poll_ka.events = EPOLLIN;
+	memset(&poll_ka.data, 0, sizeof(poll_ka.data));
+	poll_ka.data.fd = session->keepalive_timer_fd;
+	ret = epoll_ctl(pollfd, EPOLL_CTL_ADD, session->keepalive_timer_fd, &poll_ka);
+	if(ret != 0)
+	{
+		tunnel_trace(session, LOG_ERR, "failed to add keepalive timer to epoll "
+		             "context: %s (%d)", strerror(errno), errno);
+		goto close_pollfd;
+	}
+
+	/* will monitor the packing timer */
+	poll_packing.events = EPOLLIN;
+	memset(&poll_packing.data, 0, sizeof(poll_packing.data));
+	poll_packing.data.fd = session->packing_timer_fd;
+	ret = epoll_ctl(pollfd, EPOLL_CTL_ADD, session->packing_timer_fd,
+	                &poll_packing);
+	if(ret != 0)
+	{
+		tunnel_trace(session, LOG_ERR, "failed to add packing timer to epoll "
+		             "context: %s (%d)", strerror(errno), errno);
+		goto close_pollfd;
+	}
+
+	/* don't monitor TUN and RAW socket now */
+	poll_tun.data.fd = -1;
+	poll_raw.data.fd = -1;
+
+	/* send initial control message to remote peer if asked to do so */
+	if(session->start_ctrl != NULL)
+	{
+		if(!session->start_ctrl(session))
+		{
+			tunnel_trace(session, LOG_ERR, "failed to send initial control "
+			             "message to remote peer");
+			goto close_pollfd;
+		}
+	}
+
+	/* main loop of client */
+	do
+	{
+		int timeout;
+		int ret;
+
+		/* wait at most twice the keepalive timeout */
+		timeout = 80;
+		if(session->status == IPROHC_SESSION_CONNECTED)
+		{
+			timeout = session->tunnel.params.keepalive_timeout * 2;
+		}
+
+		/* wait for events */
+		ret = epoll_wait(pollfd, events, max_events_nr, timeout * 1000);
+		if(ret < 0)
+		{
+			tunnel_trace(session, LOG_ERR, "epoll failed: %s (%d)",
+			             strerror(errno), errno);
+			failure = 1;
+			session->status = IPROHC_SESSION_PENDING_DELETE;
+			goto close_pollfd;
+		}
+		else if(ret == 0)
+		{
+			/* no event occurred */
+			tunnel_trace(session, LOG_DEBUG, "epoll: no event occurred");
+			continue;
+		}
+		tunnel_trace(session, LOG_DEBUG, "epoll: %d events detected", ret);
+
+		/* stop thread if main thread closed the write side of the pipe */
+		if(events[0].data.fd == session->p2c[0])
+		{
+			session->status = IPROHC_SESSION_PENDING_DELETE;
+			goto close_pollfd;
+		}
+
+		/* event on control channel? */
+		if(events[0].data.fd == session->tcp_socket)
+		{
+			const size_t max_msg_len = 1024;
+			unsigned char msg[max_msg_len];
+			size_t msg_len;
+			int ret;
+
+			tunnel_trace(session, LOG_DEBUG, "read on control socket");
+			ret = gnutls_record_recv(session->tls_session, msg, max_msg_len);
+			if(ret < 0)
+			{
+				tunnel_trace(session, LOG_ERR, "failed to receive data from remote "
+				             "peer on TLS session: %s (%d)", gnutls_strerror(ret), ret);
+				session->status = IPROHC_SESSION_PENDING_DELETE;
+				goto close_pollfd;
+			}
+			else if(ret == 0)
+			{
+				tunnel_trace(session, LOG_ERR, "TLS session was interrupted by "
+				             "remote peer");
+				session->status = IPROHC_SESSION_PENDING_DELETE;
+				goto close_pollfd;
+			}
+			msg_len = ret;
+			tunnel_trace(session, LOG_DEBUG, "[thread] received %zu byte(s) on TCP socket",
+			             msg_len);
+
+			/* handle request */
+			if(!session->handle_ctrl_msg(session, msg, msg_len))
+			{
+				if(session->status == IPROHC_SESSION_CONNECTED)
+				{
+					tunnel_trace(session, LOG_NOTICE, "client was disconnected");
+					session->status = IPROHC_SESSION_PENDING_DELETE;
+					goto close_pollfd;
+				}
+				else if(session->status == IPROHC_SESSION_CONNECTING)
+				{
+					tunnel_trace(session, LOG_NOTICE, "client failed to connect");
+					session->status = IPROHC_SESSION_PENDING_DELETE;
+					goto close_pollfd;
+				}
+				assert(0); /* should not happen */
+			}
+			else if(session->status == IPROHC_SESSION_PENDING_DELETE)
+			{
+				tunnel_trace(session, LOG_INFO, "session closed");
+				continue;
+			}
+			else
+			{
+				if(session->status == IPROHC_SESSION_CONNECTED)
+				{
+					if(poll_tun.data.fd < 0)
+					{
+						/* will monitor the TUN fd */
+						poll_tun.events = EPOLLIN;
+						memset(&poll_tun.data, 0, sizeof(poll_tun.data));
+						poll_tun.data.fd = tunnel->tun_fd_in;
+						ret = epoll_ctl(pollfd, EPOLL_CTL_ADD, tunnel->tun_fd_in,
+						                &poll_tun);
+						if(ret != 0)
+						{
+							trace(LOG_ERR, "[main] failed to add TUN to epoll context: "
+							      "%s (%d)", strerror(errno), errno);
+							goto close_pollfd;
+						}
+					}
+					if(poll_raw.data.fd < 0)
+					{
+						/* will monitor the TUN fd */
+						poll_raw.events = EPOLLIN;
+						memset(&poll_raw.data, 0, sizeof(poll_raw.data));
+						poll_raw.data.fd = tunnel->raw_socket_in;
+						ret = epoll_ctl(pollfd, EPOLL_CTL_ADD, tunnel->raw_socket_in,
+						                &poll_raw);
+						if(ret != 0)
+						{
+							trace(LOG_ERR, "[main] failed to add RAW socket to epoll "
+							      "context: %s (%d)", strerror(errno), errno);
+							goto close_pollfd;
+						}
+
+						/* ROHC compatibility mode? */
+						if(session->tunnel.params.rohc_compat_version == IPROHC_ROHC_COMPAT_1_6_x)
+						{
+							trace(LOG_INFO, "enable ROHC 1.6.x compatibility mode");
+							if(!rohc_comp_set_features(session->tunnel.comp,
+							                           ROHC_COMP_FEATURE_COMPAT_1_6_x))
+							{
+								trace(LOG_ERR, "failed to enable ROHC 1.6.x compatibility mode");
+								goto close_pollfd;
+							}
+							if(!rohc_decomp_set_features(session->tunnel.decomp,
+							                             ROHC_DECOMP_FEATURE_COMPAT_1_6_x))
+							{
+								trace(LOG_ERR, "failed to enable ROHC 1.6.x compatibility mode");
+								goto close_pollfd;
+							}
+						}
+					}
+				}
+
+				/* re-arm keepalive timer */
+				if(!iprohc_session_update_keepalive(session,
+				                                    tunnel->params.keepalive_timeout))
+				{
+					tunnel_trace(session, LOG_ERR, "failed to update the keepalive "
+					             "timeout to %zu seconds",
+					             tunnel->params.keepalive_timeout);
+					session->status = IPROHC_SESSION_PENDING_DELETE;
+					goto close_pollfd;
+				}
+				session->keepalive_misses = 0;
+			}
+		}
+
+		/* send keepalive in case there is too few activity on control channel */
+		if(events[0].data.fd == session->keepalive_timer_fd)
+		{
+			const char command[1] = { C_KEEPALIVE };
+			uint64_t keepalive_timer_nr;
+
+			tunnel_trace(session, LOG_DEBUG, "keepalive timer expired");
+			ret = read(session->keepalive_timer_fd, &keepalive_timer_nr,
+			           sizeof(uint64_t));
+			if(ret < 0)
+			{
+				tunnel_trace(session, LOG_ERR, "failed to read keepalive timer: "
+				             "%s (%d)", strerror(errno), errno);
+				session->status = IPROHC_SESSION_PENDING_DELETE;
+				goto close_pollfd;
+			}
+			else if(ret != sizeof(uint64_t))
+			{
+				tunnel_trace(session, LOG_ERR, "failed to read keepalive timer: "
+				             "received %d bytes while expecting %zu bytes",
+				             ret, sizeof(uint64_t));
+				session->status = IPROHC_SESSION_PENDING_DELETE;
+				goto close_pollfd;
+			}
+
+			if(session->keepalive_misses >= 3)
+			{
+				tunnel_trace(session, LOG_NOTICE, "keepalive timeout detected "
+				             "(%zu keepalive messages every %zu seconds without "
+				             "answer), disconnect client", session->keepalive_misses,
+				             tunnel->params.keepalive_timeout / 3);
+				session->status = IPROHC_SESSION_PENDING_DELETE;
+			}
+			else
+			{
+				session->keepalive_misses++;
+				tunnel_trace(session, LOG_DEBUG, "send a keepalive command %zu/3",
+				             session->keepalive_misses);
+				gnutls_record_send(session->tls_session, command, 1);
+			}
+		}
+
+		/* flush the incomplete packing frame being built if too few activity
+		 * on data channel */
+		if(events[0].data.fd == session->packing_timer_fd)
+		{
+			uint64_t timer_nr;
+
+			tunnel_trace(session, LOG_DEBUG, "packing timer expired");
+			ret = read(session->packing_timer_fd, &timer_nr, sizeof(uint64_t));
+			if(ret < 0)
+			{
+				tunnel_trace(session, LOG_ERR, "failed to read packing timer: "
+				             "%s (%d)", strerror(errno), errno);
+				goto close_pollfd;
+			}
+			else if(ret != sizeof(uint64_t))
+			{
+				tunnel_trace(session, LOG_ERR, "failed to read packing timer: "
+				             "received %d bytes while expecting %zu bytes",
+				             ret, sizeof(uint64_t));
+				goto close_pollfd;
+			}
+
+			/* flush any incomplete packing frame */
+			if(packing_cur_len > 0)
+			{
+				tunnel_trace(session, LOG_DEBUG, "no packets since a while, "
+				             "flushing incomplete frame");
+				send_puree(tunnel->raw_socket_out, session->dst_addr, tunnel->basedev_mtu,
+				           tunnel->packing_frame, &packing_cur_len, &packing_cur_pkts,
+				           &(tunnel->stats));
+				assert(packing_cur_len == 0);
+				assert(packing_cur_pkts == 0);
+			}
+		}
+
+		/* bridge from TUN to RAW */
+		if(session->status == IPROHC_SESSION_CONNECTED &&
+		   events[0].data.fd == tunnel->tun_fd_in)
+		{
+			const size_t packing_max_len = tunnel->basedev_mtu - sizeof(struct iphdr);
+			const size_t packing_pkts_old = packing_cur_pkts;
+			struct itimerspec packing_timeout;
+
+			tunnel_trace(session, LOG_DEBUG, "received data from tun");
+			failure = tun2raw(tunnel->comp, tunnel->tun_fd_in,
+			                  tunnel->raw_socket_out, session->dst_addr,
+			                  tunnel->basedev_mtu, tunnel->packing_frame,
+			                  packing_max_len, &packing_cur_len,
+			                  tunnel->params.packing, &packing_cur_pkts,
+			                  &(tunnel->stats));
+			if(failure)
+			{
+				tunnel_trace(session, LOG_NOTICE, "tun2raw failed");
+			}
+
+			/* disarm packing timer if no packing frame is being built,
+			 * re-arm packing timer if we have just started a new packing frame */
+			if(packing_cur_pkts == 0)
+			{
+				/* disarm packing timer */
+				tunnel_trace(session, LOG_DEBUG, "reset packing timer");
+				packing_timeout.it_value.tv_sec = 0;
+				packing_timeout.it_value.tv_nsec = 0;
+				packing_timeout.it_interval.tv_sec = 0;
+				packing_timeout.it_interval.tv_nsec = 0;
+				ret = timerfd_settime(session->packing_timer_fd, 0, &packing_timeout, NULL);
+				if(ret != 0)
+				{
+					tunnel_trace(session, LOG_ERR, "failed to disarm packing timer: "
+					             "%s (%d)", strerror(errno), errno);
+					goto close_pollfd;
+				}
+			}
+			else if(packing_cur_pkts != packing_pkts_old)
+			{
+				/* re-arm packing timer */
+				tunnel_trace(session, LOG_DEBUG, "re-arm packing timer for "
+				             "incomplete frame with %zu packets", packing_cur_pkts);
+				packing_timeout.it_value.tv_sec = 0;
+				packing_timeout.it_value.tv_nsec = 100 * 1e6; /* 100ms */
+				packing_timeout.it_interval.tv_sec = 0;
+				packing_timeout.it_interval.tv_nsec = 0;
+				ret = timerfd_settime(session->packing_timer_fd, 0, &packing_timeout, NULL);
+				if(ret != 0)
+				{
+					tunnel_trace(session, LOG_ERR, "failed to re-arm packing timer: "
+					             "%s (%d)", strerror(errno), errno);
+					goto close_pollfd;
+				}
+			}
+		}
+
+		/* bridge from RAW to TUN */
+		if(session->status == IPROHC_SESSION_CONNECTED &&
+		   events[0].data.fd == tunnel->raw_socket_in)
+		{
+			tunnel_trace(session, LOG_DEBUG, "received data from raw");
+			failure = raw2tun(tunnel->decomp, session->src_addr.s_addr,
+			                  tunnel->raw_socket_in, tunnel->tun_fd_out,
+			                  tunnel->basedev_mtu, &(tunnel->stats));
+			if(failure)
+			{
+				tunnel_trace(session, LOG_NOTICE, "raw2tun failed");
+			}
+		}
+	}
+	while(session->status >= IPROHC_SESSION_CONNECTING);
+
+	tunnel_trace(session, LOG_INFO, "client thread was asked to stop");
+
+	/* send final control message to remote peer if asked to do so */
+	if(session->stop_ctrl != NULL)
+	{
+		if(!session->stop_ctrl(session))
+		{
+			tunnel_trace(session, LOG_ERR, "failed to send final control "
+			             "message to remote peer");
+			goto close_pollfd;
+		}
+	}
+
+close_pollfd:
+	close(pollfd);
+tls_bye:
+	/* close TLS session */
+	tunnel_trace(session, LOG_INFO, "close TLS session");
+	gnutls_bye(session->tls_session, GNUTLS_SHUT_WR);
+error:
+	tunnel_trace(session, LOG_INFO, "end of thread");
+	session->status = IPROHC_SESSION_PENDING_DELETE;
+	AO_store_release_write(&(session->is_thread_running), 0);
+	return NULL;
+}
+
+
+/**
+ * @brief Send the current packet
+ *
+ * The function actually send to the RAW socket the send-to-be "floating"
+ * packet. It is triggered:
+ *  - when the packet contains \e packing packets (nominal case)
+ *  - when including another packet would make this packet too big for MTU
+ *  - when no packet were sent for 1 seconds
+ *
+ * @param to                The RAW socket descriptor to write to
+ * @param raddr             The remote address of the tunnel
+ * @param mtu               The MTU of the underlying network interface
+ * @param compressed_packet Pointer to the send-to-be "floating" packet when
+ *                          *act_comp = packing or timeout
+ * @param total_size        Pointer to the total size of the send-to-be
+ *                          "floating" packet
+ * @param act_comp          Pointer to the current number of packet in packing
+ * @param stats             The compression/decompression statistics
+ */
+int send_puree(int to,
+               struct in_addr raddr,
+               const size_t mtu,
+               unsigned char *compressed_packet,
+               size_t *total_size,
+               size_t *act_comp,
+               struct statitics *stats)
+{
+	int ret;
+	struct sockaddr_in addr;
+
+	bzero(&addr, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = raddr.s_addr;
+
+	dump_packet("Packet ROHC: ", compressed_packet, *total_size);
+	stats->stats_packing[*act_comp] += 1;
+
+	if((*total_size) > (mtu - sizeof(struct iphdr)))
+	{
+		trace(LOG_ERR, "Packet too big to be sent, abort");
+		goto error;
+	}
+
+	/* write the ROHC packet in the RAW tunnel */
+	trace(LOG_DEBUG, "Sending on raw socket to %s\n",  inet_ntoa(raddr));
+	ret = sendto(to, compressed_packet, *total_size, 0,
+	             (struct sockaddr *) &addr, sizeof(struct sockaddr_in));
+	if(ret < 0)
+	{
+		trace(LOG_ERR, "sendto failed: %s (%d)\n", strerror(errno), errno);
+		goto error;
+	}
+	trace(LOG_DEBUG, "%zu bytes written on socket %d\n", *total_size, to);
+
+	/* reset packing variables */
+	*total_size = 0;
+	*act_comp   = 0;
+	return 0;
+
+error:
+	/* reset packing variables */
+	*total_size = 0;
+	*act_comp   = 0;
+	trace(LOG_ERR, "write to raw failed\n");
+	return -1;
+}
+
+
+/**
+ * @brief Forward IP packets received on the TUN interface to the RAW socket
+ *
+ * The function compresses the IP packets thanks to the ROHC library before
+ * sending them on the RAW socket.
+ *
+ * @param comp              The ROHC compressor
+ * @param from              The TUN file descriptor to read from
+ * @param to                The RAW socket descriptor to write to
+ * @param raddr             The remote address of the tunnel
+ * @param mtu               The MTU (in bytes) of the output interface
+ * @param packing_frame     IN/OUT: The incomplete packing frame being built
+ * @param packing_max_len   The max number of bytes in packing frame
+ * @param packing_cur_len   IN/OUT: The current number of bytes in packing
+ *                                  frame
+ * @param packing_max_pkts  The max number of packets in packing frame
+ * @param packing_cur_pkts  IN/OUT: The current number of packets in packing
+ *                                  frame
+ * @param stats             IN/OUT: The statistics of the current tunnel
+ * @return                  0 in case of success, a non-null value otherwise
+ */
+int tun2raw(struct rohc_comp *comp,
+            int from,
+            int to,
+            struct in_addr raddr,
+            const size_t mtu,
+            unsigned char *const packing_frame,
+            const size_t packing_max_len,
+            size_t *const packing_cur_len,
+            const size_t packing_max_pkts,
+            size_t *const packing_cur_pkts,
+            struct statitics *stats)
+{
+	const struct rohc_ts arrival_time = { .sec = 0, .nsec = 0 };
+	const size_t packing_header_len = 2;
+
+	unsigned char buffer[TUNTAP_BUFSIZE];
+	unsigned int buffer_len = TUNTAP_BUFSIZE;
+
+	unsigned char rohc_packet_temp[TUNTAP_BUFSIZE];
+	unsigned char *rohc_packet_p;
+#ifdef ROHC_VER_LESS_2_0
+	size_t rohc_size;
+#endif
+
+	unsigned char *packet;
+	unsigned int packet_len;
+
+	rohc_comp_last_packet_info2_t last_packet_info;
+
+	int ret;
+	bool ok;
+#ifndef ROHC_VER_LESS_2_0
+	const size_t output_packet_max_len =
+		max(ETHER_HDR_LEN, LINUX_COOKED_HDR_LEN) + MAX_ROHC_SIZE;
+	uint8_t output_packet[output_packet_max_len];
+	struct rohc_buf rohc_packet =
+		rohc_buf_init_empty(output_packet, output_packet_max_len);
+#endif
+
+	/* sanity checks */
+	assert(comp != NULL);
+	assert(packing_frame != NULL);
+	assert(packing_cur_len != NULL);
+	assert(packing_cur_pkts != NULL);
+	assert(packing_max_len > packing_header_len);
+	assert(packing_max_pkts > 0);
+	assert((*packing_cur_len) < packing_max_len);
+	assert((*packing_cur_pkts) < packing_max_pkts);
+
+	/* read the IP packet from the virtual interface */
+	ret = read(from, buffer, buffer_len);
+	if(ret < 0)
+	{
+		trace(LOG_ERR, "Read failed: %s (%d)\n", strerror(errno), errno);
+		goto error;
+	}
+	buffer_len = ret;
+
+	trace(LOG_DEBUG, "Read %u bytes on tun fd %d\n", ret, from);
+
+	dump_packet("Read from tun", buffer, buffer_len);
+
+	if(buffer_len == 0)
+	{
+		goto quit;
+	}
+	else if(buffer_len < sizeof(struct tun_pi))
+	{
+		trace(LOG_ERR, "tun2raw: drop invalid packet: too small for TUN header");
+		goto quit;
+	}
+
+	/* We skip the 4 bytes TUN header */
+	/* XXX : To be parametrized if fd is not tun */
+	packet = buffer + sizeof(struct tun_pi);
+	packet_len = buffer_len - sizeof(struct tun_pi);
+#ifndef ROHC_VER_LESS_2_0
+	struct rohc_buf ip_packet = rohc_buf_init_full(packet, packet_len, arrival_time);
+#endif
+	/* update stats */
+	stats->comp_total++;
+
+	/* compress the IP packet */
+#ifdef ROHC_VER_LESS_2_0
+	ret = rohc_compress3(comp, arrival_time, packet, packet_len,
+	                     rohc_packet_temp, MAX_ROHC_SIZE, &rohc_size);
+	if(ret != ROHC_OK)
+#else
+	ret = rohc_compress4(comp, ip_packet, &rohc_packet);
+	if(ret != ROHC_STATUS_OK)
+#endif
+	{
+		trace(LOG_ERR, "compression of packet failed (%d)\n", ret);
+		goto error;
+	}
+
+	/* discard ROHC packets larger than the whole packing frame */
+#ifdef ROHC_VER_LESS_2_0
+	if(rohc_size > (packing_max_len - packing_header_len))
+	{
+		trace(LOG_ERR, "discard too large compressed packet: packet is "
+		      "%zd-byte long, but packing frame can only handle up to %zd-byte "
+		      "packets\n", rohc_size, packing_max_len - packing_header_len);
+		goto quit;
+	}
+#else
+	if(rohc_packet.len > (packing_max_len - packing_header_len))
+#endif
+	{
+		trace(LOG_ERR, "discard too large compressed packet: packet is "
+		      "%zd-byte long, but packing frame can only handle up to %zd-byte "
+		      "packets\n", rohc_packet.len, packing_max_len - packing_header_len);
+		goto quit;
+	}
+
+	/* send current incomplete packing frame if the total size including the
+	 * new ROHC packet will be over the MTU, thus making room for the new
+	 * compressed packet */
+	/* XXX : MTU should also be a parameter */
+#ifdef ROHC_VER_LESS_2_0
+	if(((*packing_cur_len) + rohc_size + packing_header_len) >= packing_max_len)
+#else
+	if(((*packing_cur_len) + rohc_packet.len + packing_header_len) >= packing_max_len)
+#endif
+	{
+		send_puree(to, raddr, mtu, packing_frame, packing_cur_len,
+		           packing_cur_pkts, stats);
+		assert((*packing_cur_len) == 0);
+		assert((*packing_cur_pkts) == 0);
+	}
+
+	trace(LOG_DEBUG, "Compress packet #%zd/%zd: %d bytes", *packing_cur_pkts,
+	      packing_max_pkts, packet_len);
+	/* Not very true, as the packet is already compressed, but the act_comp may
+	 * have changed if the packet has ben sent because of the new size */
+
+	/* rohc_packet_p will point the correct place for the new packet */
+	rohc_packet_p = packing_frame + (*packing_cur_len);
+
+#ifdef ROHC_VER_LESS_2_0
+	trace(LOG_DEBUG, "Packet #%zd/%zd compressed: %zd bytes",
+	      *packing_cur_pkts, packing_max_pkts, rohc_size);
+	dump_packet("Compressed packet", rohc_packet_temp, rohc_size);
+#else
+	trace(LOG_DEBUG, "Packet #%zd/%zd compressed: %zd bytes",
+	      *packing_cur_pkts, packing_max_pkts, rohc_packet.len);
+	dump_packet("Compressed packet", rohc_packet_temp, rohc_packet.len);
+#endif
+	/* get packet statistics */
+	/* Fill ROHC version */
+	last_packet_info.version_major = 0;
+	last_packet_info.version_minor = 0;
+	ok = rohc_comp_get_last_packet_info2(comp, &last_packet_info);
+	if(!ok)
+	{
+		trace(LOG_ERR, "Cannot get stats about the last compressed packet\n");
+	}
+	else
+	{
+		stats->head_comp_size    += last_packet_info.header_last_comp_size;
+		stats->head_uncomp_size  += last_packet_info.header_last_uncomp_size;
+		stats->total_comp_size   += last_packet_info.total_last_comp_size;
+		stats->total_uncomp_size += last_packet_info.total_last_uncomp_size;
+	}
+
+	/* Addind size byte(s) */
+#ifdef ROHC_VER_LESS_2_0
+	if(rohc_size >= 128)
+	{
+		/* over 128 => 2 bytes with the first bit to 1 and the length coded on 15 bits */
+		*((uint16_t*) rohc_packet_p) = htons(rohc_size | (1 << 15));  /* 0b1000000000000000 */
+		rohc_packet_p += 2;
+		*packing_cur_len += 2;
+	}
+	else
+	{
+		/* under 128 => 1 bytes with the first bit to 0 and the length coded on 7 bits */
+		*rohc_packet_p = rohc_size;
+		rohc_packet_p += 1;
+		*packing_cur_len += 1;
+	}
+#else
+	if(rohc_packet.len >= 128)
+	{
+		/* over 128 => 2 bytes with the first bit to 1 and the length coded on 15 bits */
+		*((uint16_t*) rohc_packet_p) = htons(rohc_packet.len | (1 << 15));  /* 0b1000000000000000 */
+		rohc_packet_p += 2;
+		*packing_cur_len += 2;
+	}
+	else
+	{
+		/* under 128 => 1 bytes with the first bit to 0 and the length coded on 7 bits */
+		*rohc_packet_p = rohc_packet.len;
+		rohc_packet_p += 1;
+		*packing_cur_len += 1;
+	}
+#endif
+
+#ifdef ROHC_VER_LESS_2_0
+	/* Copy newly compressed packet in "floating" packet */
+	memcpy(rohc_packet_p, rohc_packet_temp, rohc_size);
+
+	*packing_cur_len += rohc_size;
+#else
+	/* Copy newly compressed packet in "floating" packet */
+	memcpy(rohc_packet_p, rohc_packet_temp, rohc_packet.len);
+
+	*packing_cur_len += rohc_packet.len;
+#endif
+	(*packing_cur_pkts)++;
+
+	if((*packing_cur_pkts) >= packing_max_pkts)
+	{
+		/* All packets loaded: GOGOGO */
+		send_puree(to, raddr, mtu, packing_frame, packing_cur_len,
+		           packing_cur_pkts, stats);
+		assert((*packing_cur_len) == 0);
+		assert((*packing_cur_pkts) == 0);
+	}
+
+quit:
+	return 0;
+error:
+	stats->comp_failed++;
+	return 1;
+}
+
+
+/**
+ * @brief Forward ROHC packets received on the RAW socket to the TUN interface
+ *
+ * The function decompresses the ROHC packets thanks to the ROHC library before
+ * sending them on the TUN interface.
+ *
+ * @param decomp    The ROHC decompressor
+ * @param dst_addr  The IP destination address to filter traffic on
+ * @param from      The RAW socket descriptor to read from
+ * @param to        The TUN file descriptor to write to
+ * @param mtu       The MTU (in bytes) of the input interface
+ * @param stats     The decompression statistics
+ * @return          0 in case of success, a non-null value otherwise
+ */
+int raw2tun(struct rohc_decomp *decomp,
+				in_addr_t dst_addr,
+				int from,
+				int to,
+				const size_t mtu,
+				struct statitics *stats)
+{
+	const struct rohc_ts arrival_time = { .sec = 0, .nsec = 0 };
+
+	unsigned char packet[TUNTAP_BUFSIZE];
+	unsigned int packet_len = TUNTAP_BUFSIZE;
+	struct iphdr *ip_header;
+
+	unsigned char *ip_payload;
+	size_t ip_payload_len;
+
+#ifdef ROHC_VER_LESS_2_0
+	/* We add the 4 bytes of TUN headers */
+	unsigned char decomp_packet[4 + MAX_ROHC_SIZE];
+
+#else
+	/* the buffer that will contain the uncompressed packet */
+	/* We add the 4 bytes of TUN headers */
+	uint8_t ip_buffer[4 + MAX_ROHC_SIZE];
+	struct rohc_buf decomp_packet = rohc_buf_init_empty(ip_buffer + 4, MAX_ROHC_SIZE);
+#endif
+
+	uint16_t csum;
+
+	int ret;
+	int i = 0;
+
+	/* read ROHC packet from the RAW tunnel */
+	ret = read(from, packet, packet_len);
+	if(ret < 0 || ret > packet_len)
+	{
+		trace(LOG_ERR, "recvfrom failed: %s (%d)\n", strerror(errno), errno);
+		goto error_unpack;
+	}
+	if(ret == 0)
+	{
+		trace(LOG_ERR, "Empty packet received");
+		goto ignore;
+	}
+	packet_len = ret;
+	stats->total_received++;
+
+	dump_packet("Decompressing: ", packet, packet_len);
+
+	/* check that data is a valid IPv4 packet */
+	if(packet_len <= 20)
+	{
+		trace(LOG_ERR, "bad packet received: too small for IPv4 header, "
+		      "only %u bytes received", packet_len);
+		goto error_unpack;
+	}
+	ip_header = (struct iphdr *) packet;
+	if(ip_header->version != 4)
+	{
+		trace(LOG_ERR, "bad packet received: not IP version 4");
+		goto error_unpack;
+	}
+	if(ip_header->ihl != 5)
+	{
+		trace(LOG_ERR, "bad packet received: IP options not supported");
+		goto error_unpack;
+	}
+	csum = ip_fast_csum(packet, ip_header->ihl);
+	if(csum != 0)
+	{
+		trace(LOG_ERR, "bad packet received: wrong IP checksum");
+		goto error_unpack;
+	}
+
+	/* filter on IP destination address if asked */
+	if(dst_addr != INADDR_ANY && ntohl(ip_header->daddr) != dst_addr)
+	{
+		trace(LOG_DEBUG, "filter out IP traffic with non-matching IP "
+		      "destination address");
+		goto ignore;
+	}
+
+	/* skip the IPv4 header */
+	ip_payload = packet + (ip_header->ihl * 4);
+	ip_payload_len = packet_len - (ip_header->ihl * 4);
+
+	trace(LOG_DEBUG, "read one %zu-byte packed ROHC packet on RAW sock\n",
+	      ip_payload_len);
+
+	/* unpack, then decompress the ROHC packets */
+	while(ip_payload_len > 0)
+	{
+#ifdef ROHC_VER_LESS_2_0
+		size_t decomp_size;
+#endif
+		int len;
+
+		/* Get packet size */
+		if(ip_payload[0] >= 128)
+		{
+			len = ntohs(*((uint16_t*) ip_payload)) & (~(1 << 15)); /* 0b0111111111111111 */;
+			ip_payload += 2;
+			ip_payload_len -= 2;
+		}
+		else
+		{
+			len = ip_payload[0];
+			ip_payload += 1;
+			ip_payload_len -= 1;
+		}
+		stats->decomp_total++;
+
+		trace(LOG_DEBUG, "Packet #%d : %d bytes", i, len);
+		i++;
+
+		/* Some basic checks on packet length */
+		if(len > MAX_ROHC_SIZE)
+		{
+			trace(LOG_ERR, "Packet too big, skipping");
+			goto error_unpack;
+		}
+
+		if(len > ip_payload_len)
+		{
+			trace(LOG_ERR, "Packet bigger than containing packet, skipping all");
+			goto error_unpack;
+		}
+
+		dump_packet("Packet: ", ip_payload, len);
+
+		/* decompress the packet */
+#ifdef ROHC_VER_LESS_2_0
+		ret = rohc_decompress2(decomp, arrival_time, ip_payload, len,
+		                       &decomp_packet[4], MAX_ROHC_SIZE, &decomp_size);
+		if(ret != ROHC_OK)
+		{
+			trace(LOG_ERR, "decompression of packet failed (%d)\n", ret);
+			goto error;
+		}
+
+		/* build the TUN header */
+		/* XXX : If not tun ?? */
+		decomp_packet[0] = 0;
+		decomp_packet[1] = 0;
+		switch((decomp_packet[4] >> 4) & 0x0f)
+		{
+			case 4: /* IPv4 */
+				decomp_packet[2] = 0x08;
+				decomp_packet[3] = 0x00;
+				break;
+			case 6: /* IPv6 */
+				decomp_packet[2] = 0x86;
+				decomp_packet[3] = 0xdd;
+				break;
+			default:
+				trace(LOG_ERR, "bad IP version (%d)\n",
+				      (decomp_packet[4] >> 4) & 0x0f);
+				goto error;
+		}
+#else
+		struct rohc_buf rohc_packet =
+			rohc_buf_init_full(ip_payload, len, arrival_time);
+		ret = rohc_decompress3(decomp, rohc_packet, &decomp_packet, NULL, NULL);
+		if(ret != ROHC_STATUS_OK)
+		{
+			trace(LOG_ERR, "decompression of packet failed (%d)\n", ret);
+			goto error;
+		}
+
+		/* build the TUN header */
+		/* XXX : If not tun ?? */
+		decomp_packet.data[0] = 0;
+		decomp_packet.data[1] = 0;
+		switch((decomp_packet.data[4] >> 4) & 0x0f)
+		{
+			case 4: /* IPv4 */
+				decomp_packet.data[2] = 0x08;
+				decomp_packet.data[3] = 0x00;
+				break;
+			case 6: /* IPv6 */
+				decomp_packet.data[2] = 0x86;
+				decomp_packet.data[3] = 0xdd;
+				break;
+			default:
+				trace(LOG_ERR, "bad IP version (%d)\n",
+				      (decomp_packet.data[4] >> 4) & 0x0f);
+				goto error;
+		}
+#endif
+		/* write the IP packet on the virtual interface */
+		ret = write(to, &decomp_packet.data, decomp_packet.len + 4);
+		if(ret < 0)
+		{
+			trace(LOG_ERR, "write failed: %s (%d)\n", strerror(errno), errno);
+			goto error;
+		}
+		trace(LOG_DEBUG, "%u bytes written on fd %d\n", ret, to);
+
+		ip_payload += len;
+		ip_payload_len -= len;
+	}
+
+ignore:
+	return 0;
+error:
+	stats->decomp_failed++;
+	return -1;
+error_unpack:
+	stats->unpack_failed++;
+	return -2;
+}
+
+
+/* Trace functions */
+
+/**
+ * @brief Display the content of a IP or ROHC packet
+ *
+ * This function is used for debugging purposes.
+ *
+ * @param descr   A string that describes the packet
+ * @param packet  The packet to display
+ * @param length  The length of the packet to display
+ */
+void dump_packet(char *descr, unsigned char *packet, unsigned int length)
+{
+	unsigned int i;
+	char line[1024];
+	char tmp[4];
+
+	trace(LOG_DEBUG, "-------------------------------\n");
+	trace(LOG_DEBUG, "%s (%u bytes):\n", descr, length);
+	line[0] = '\0';
+	for(i = 0; i < length; i++)
+	{
+		if(i > 0 && (i % 16) == 0)
+		{
+			trace(LOG_DEBUG, "%s", line);
+			line[0] = '\0';
+		}
+		else if(i > 0 && (i % 8) == 0)
+		{
+			strcat(line, "\t");
+		}
+		snprintf(tmp, 4, "%.2x ", packet[i]);
+		strcat(line, tmp);
+	}
+	if(line[0] != '\0')
+	{
+		trace(LOG_DEBUG, "%s", line);
+	}
+	trace(LOG_DEBUG, "-------------------------------\n");
+}
+
+#ifdef ROHC_VER_LESS_2_0
+/**
+ * @brief Callback to print traces of the ROHC library
+ *
+ * @param level    The priority level of the trace
+ * @param entity   The entity that emitted the trace among:
+ *                  \li ROHC_TRACE_COMP
+ *                  \li ROHC_TRACE_DECOMP
+ * @param profile  The ID of the ROHC compression/decompression profile
+ *                 the trace is related to
+ * @param format   The format string of the trace
+ */
+static void print_rohc_traces(rohc_trace_level_t level,
+                              rohc_trace_entity_t entity,
+                              int profile,
+                              const char *format, ...)
+{
+	va_list args;
+	int syslog_level;
+	char*entity_s;
+	char extended[MAX_TRACE_SIZE];
+	char message[MAX_TRACE_SIZE];
+
+	/* Bijection between ROHC levels and syslog ones */
+	switch(level)
+	{
+		case ROHC_TRACE_DEBUG:
+			syslog_level = LOG_DEBUG;
+			break;
+		case ROHC_TRACE_INFO:
+			syslog_level = LOG_DEBUG;  /* intended, ROHC lib is too verbose */
+			break;
+		case ROHC_TRACE_WARNING:
+			syslog_level = LOG_WARNING;
+			break;
+		case ROHC_TRACE_ERROR:
+			syslog_level = LOG_ERR;
+			break;
+		case ROHC_TRACE_LEVEL_MAX:
+			syslog_level = LOG_CRIT;
+			break;
+		default:
+			syslog_level = LOG_ERR;
+	}
+
+	switch(entity)
+	{
+		case ROHC_TRACE_COMP:
+			entity_s = "ROHC compressor";
+			break;
+		case ROHC_TRACE_DECOMP:
+			entity_s = "ROHC decompressor";
+			break;
+		default:
+			entity_s = "Unknown ROHC entity";
+	}
+
+	va_start(args, format);
+	if(vsnprintf(extended, MAX_TRACE_SIZE, format, args) >= MAX_TRACE_SIZE)
+	{
+		trace(LOG_WARNING, "Following trace has been truncated\n");
+	}
+	va_end(args);
+
+	if(strlen(extended) == 5 && extended[0] == '0' && extended[1] == 'x')
+	{
+		/* annoying packet dump trace, don't trace it */
+		return;
+	}
+
+	if(snprintf(message, MAX_TRACE_SIZE, "%s[%d] : %s", entity_s, profile,
+	            extended) >= MAX_TRACE_SIZE)
+	{
+		trace(LOG_WARNING, "Following trace has been truncated\n");
+	}
+	trace(syslog_level, "%s", message);
+}
+#else
+/**
+ * @brief Callback to print traces of the ROHC library
+ *
+ * @param priv_ctxt  An optional private context, may be NULL
+ * @param level      The priority level of the trace
+ * @param entity     The entity that emitted the trace among:
+ *                    \li ROHC_TRACE_COMP
+ *                    \li ROHC_TRACE_DECOMP
+ * @param profile    The ID of the ROHC compression/decompression profile
+ *                   the trace is related to
+ * @param format     The format string of the trace
+ */
+static void print_rohc_traces(void *const priv_ctxt __attribute__((unused)),
+                              const rohc_trace_level_t level,
+                              const rohc_trace_entity_t entity __attribute__((unused)),
+                              const int profile __attribute__((unused)),
+                              const char *format, ...)
+{
+	va_list args;
+	int syslog_level;
+	char*entity_s;
+	char extended[MAX_TRACE_SIZE];
+	char message[MAX_TRACE_SIZE];
+
+	/* Bijection between ROHC levels and syslog ones */
+	switch(level)
+	{
+		case ROHC_TRACE_DEBUG:
+			syslog_level = LOG_DEBUG;
+			break;
+		case ROHC_TRACE_INFO:
+			syslog_level = LOG_DEBUG;  /* intended, ROHC lib is too verbose */
+			break;
+		case ROHC_TRACE_WARNING:
+			syslog_level = LOG_WARNING;
+			break;
+		case ROHC_TRACE_ERROR:
+			syslog_level = LOG_ERR;
+			break;
+		case ROHC_TRACE_LEVEL_MAX:
+			syslog_level = LOG_CRIT;
+			break;
+		default:
+			syslog_level = LOG_ERR;
+	}
+
+	switch(entity)
+	{
+		case ROHC_TRACE_COMP:
+			entity_s = "ROHC compressor";
+			break;
+		case ROHC_TRACE_DECOMP:
+			entity_s = "ROHC decompressor";
+			break;
+		default:
+			entity_s = "Unknown ROHC entity";
+	}
+
+	va_start(args, format);
+	if(vsnprintf(extended, MAX_TRACE_SIZE, format, args) >= MAX_TRACE_SIZE)
+	{
+		trace(LOG_WARNING, "Following trace has been truncated\n");
+	}
+	va_end(args);
+
+	if(strlen(extended) == 5 && extended[0] == '0' && extended[1] == 'x')
+	{
+		/* annoying packet dump trace, don't trace it */
+		return;
+	}
+
+	if(snprintf(message, MAX_TRACE_SIZE, "%s[%d] : %s", entity_s, profile,
+	            extended) >= MAX_TRACE_SIZE)
+	{
+		trace(LOG_WARNING, "Following trace has been truncated\n");
+	}
+	trace(syslog_level, "%s", message);
+}
+#endif
+
+/**
+ * @brief The RTP detection callback which do detect RTP stream
+ *
+ * @param ip           The inner ip packet
+ * @param udp          The udp header of the packet
+ * @param payload      The payload of the packet
+ * @param payload_size The size of the payload (in bytes)
+ * @param rtp_private  The optional private opaque context to help detecting
+ *                     RTP streams
+ * @return             true if the packet is an RTP packet, false otherwise
+ */
+bool callback_rtp_detect(const unsigned char *const ip,
+                         const unsigned char *const udp,
+                         const unsigned char *const payload,
+                         const unsigned int payload_size,
+                         void *const rtp_private)
+{
+	uint8_t rtp_version;
+	bool is_rtp = false;
+
+	const struct udphdr *udp_packet = (struct udphdr *) udp;
+
+	/* check UDP destination port => range 10000 - 20000 fixed by asterisk */
+	/* even is for RTP, odd for RTCP, so we check the parity               */
+	if(ntohs(udp_packet->source) < 10000 ||
+	   ntohs(udp_packet->source) > 20000 ||
+	   ntohs(udp_packet->source) % 2 == 1)
+	{
+		trace(LOG_DEBUG, "RTP packet not detected (wrong UDP port (%d))\n", udp_packet->source);
+		goto not_rtp;
+	}
+
+	/* check minimal RTP header length */
+	if(payload_size < 12)
+	{
+		trace(LOG_DEBUG, "RTP packet not detected (UDP payload too short)\n");
+		goto not_rtp;
+	}
+
+	/* check RTP version field */
+	rtp_version = (*((uint8_t *) (payload)) & 0xA0) >> 6;  /* 0xA0 : 0b11000000 */
+	if(rtp_version != 2)
+	{
+		trace(LOG_DEBUG, "RTP packet not detected (wrong RTP version)\n");
+		goto not_rtp;
+	}
+
+	/* we think that the UDP packet is a RTP packet */
+	trace(LOG_DEBUG, "RTP packet detected\n");
+	is_rtp = true;
+
+not_rtp:
+	return is_rtp;
+}
+
+
+#if defined __GNUC__
+#pragma GCC diagnostic ignored "-Wint-to-pointer-cast"
+#endif
+
+static void gnutls_transport_set_ptr_nowarn(gnutls_session_t session, int ptr)
+{
+	return gnutls_transport_set_ptr(session, (gnutls_transport_ptr_t) ptr);
+}
+
+#if defined __GNUC__
+#pragma GCC diagnostic error "-Wint-to-pointer-cast"
+#endif
+
+
