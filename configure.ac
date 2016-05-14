@@ -261,13 +261,14 @@ if test "x$ac_cv_header_libnetlink_h" != "xyes" ; then
 	echo
 	exit 1
 fi
-# check whether rtnl_talk() takes 5 or 7 arguments
+# check whether rtnl_talk() takes 4 or 5 or 7 arguments
 AC_MSG_CHECKING([how many arguments rtnl_talk takes])
 AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <stdio.h>
                                      #include <stdlib.h>
                                      #include <sys/socket.h>
                                      #include <libnetlink.h>]],
-                                   [[rtnl_talk(NULL, NULL, 0, 0, NULL);]])],
+                                   [[rtnl_talk(NULL, NULL, NULL, 0);]])],
+                  [rtnl_talk_params=4],
                   [rtnl_talk_params=5],
                   [rtnl_talk_params=7])
 AC_MSG_RESULT([$rtnl_talk_params])
