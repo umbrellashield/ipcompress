@@ -298,7 +298,9 @@ bool set_ip4(int iface_index, uint32_t address, uint8_t network)
 	addattr_l(&req.nh, sizeof(req), IFA_ADDRESS, ip_data, 4);
 
 	/* GOGOGO */
-#if RTNL_TALK_PARAMS == 5
+#if RTNL_TALK_PARAMS == 4
+	ret = rtnl_talk(&rth, &req.nh, NULL, 0);
+#elif RTNL_TALK_PARAMS == 5
 	ret = rtnl_talk(&rth, &req.nh, 0, 0, NULL);
 #elif RTNL_TALK_PARAMS == 7
 	ret = rtnl_talk(&rth, &req.nh, 0, 0, NULL, NULL, NULL);
